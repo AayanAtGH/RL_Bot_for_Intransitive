@@ -1,23 +1,38 @@
 """UCI / JSON stdio bridge for querying the AlphaZero Intransitive engine."""
 
-import sys
 from pathlib import Path
-import torch
+import sys
+from typing import Optional
 
 from intransitive.core.board import Board
 from intransitive.core.constants import START_FEN
+from intransitive.core.tablebase import TablebaseManager
 from intransitive.rl.mcts import AlphaZeroPlayer
-from intransitive.rl.network import IntransitiveNet
+from intransitive.rl.network import IntransitiveNet, load_checkpoint
 
 
-def run_uci_loop(checkpoint: str = "checkpoints/alphazero_latest.pt") -> None:
-    net = IntransitiveNet()
+def run_uci_loop(
+    checkpoint: str = "checkpoints/alphazero_v2_best.pt",
+    tb_dir: str = "data/tablebase",
+    simulations: int = 200,
+) -> None:
     ckpt = Path(checkpoint)
+    if not ckpt.exists():
+        alt = Path("checkpoints/alphazero_best.pt")
+        if alt.exists():
+            ckpt = alt
     if ckpt.exists():
-        state = torch.load(ckpt, map_location="cpu", weights_only=False)
-        net.load_state_dict(state["model_state_dict"])
+        net, _ = load_checkpoint(ckpt, device="cpu", prefer_ema=True)
+    else:
+        net = IntransitiveNet()
 
-    agent = AlphaZeroPlayer(network=net, num_simulations=40)
+    tb: Optional[TablebaseManager] = None
+    if Path(tb_dir).exists():
+        cand = TablebaseManager(tb_dir)
+        if cand.is_loaded():
+            tb = cand
+
+    agent = AlphaZeroPlayer(network=net, num_simulations=simulations, tablebase=tb)
     board = Board(fen=START_FEN)
 
     for raw_line in sys.stdin:
@@ -28,7 +43,7 @@ def run_uci_loop(checkpoint: str = "checkpoints/alphazero_latest.pt") -> None:
         cmd = tokens[0]
 
         if cmd == "uci":
-            print("id name Intransitive-AlphaZero")
+            print("id name Intransitive-AlphaZero-v2")
             print("id author Antigravity")
             print("uciok")
             sys.stdout.flush()
@@ -37,8 +52,8 @@ def run_uci_loop(checkpoint: str = "checkpoints/alphazero_latest.pt") -> None:
             sys.stdout.flush()
         elif cmd == "ucinewgame":
             board = Board(fen=START_FEN)
+            agent.reset()
         elif cmd == "position":
-            # Supports: position startpos [moves m1 m2 ...] or position fen <fen> [moves m1 m2 ...]
             if "startpos" in tokens:
                 board = Board(fen=START_FEN)
                 if "moves" in tokens:

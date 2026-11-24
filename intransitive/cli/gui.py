@@ -34,10 +34,11 @@ from intransitive.core.move import (
     to_notation,
     uci_to_squares,
 )
+from intransitive.core.tablebase import TablebaseManager
 from intransitive.env.canonical import from_canonical_action
 from intransitive.rl.device import resolve_device
 from intransitive.rl.mcts import AlphaZeroPlayer
-from intransitive.rl.network import IntransitiveNet
+from intransitive.rl.network import IntransitiveNet, load_checkpoint
 
 # Visual theme matching meaf.us/rps2
 THEMES: Dict[str, Dict[str, str]] = {
@@ -124,8 +125,14 @@ class IntransitiveGUI:
         self.game_generation: int = 0
         self.current_blue_win_pct: float = 50.0
 
-        # Cached neural networks and agents
-        self._loaded_nets: Dict[str, IntransitiveNet] = {}
+        # Cached neural networks, tablebase, and agents
+        self._loaded_nets: Dict[str, torch.nn.Module] = {}
+        self.tablebase: Optional[TablebaseManager] = None
+        tb_dir = self.root_dir / "data/tablebase"
+        if tb_dir.exists():
+            tb = TablebaseManager(tb_dir)
+            if tb.is_loaded():
+                self.tablebase = tb
         self.blue_agent: Optional[Player] = None
         self.red_agent: Optional[Player] = None
 
@@ -177,27 +184,30 @@ class IntransitiveGUI:
                 except Exception as exc:
                     print(f"Warning: Failed to load piece image {fpath}: {exc}")
 
-    def _load_alphazero(self, ckpt_rel_path: str, sims: int) -> AlphaZeroPlayer:
-        ckpt_path = self.root_dir / ckpt_rel_path
-        if not ckpt_path.exists():
-            alt = self.root_dir / "checkpoints/alphazero_latest.pt"
-            if alt.exists():
-                ckpt_path = alt
+    def _load_alphazero(self, ckpt_rel_paths: List[str], sims: int) -> AlphaZeroPlayer:
+        ckpt_path = self.root_dir / ckpt_rel_paths[0]
+        for rel in ckpt_rel_paths:
+            cand = self.root_dir / rel
+            if cand.exists():
+                ckpt_path = cand
+                break
 
         key = str(ckpt_path)
         if key not in self._loaded_nets:
-            net = IntransitiveNet().to(self.device)
             if ckpt_path.exists():
-                state = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-                net.load_state_dict(state["model_state_dict"])
-            net.eval()
+                net, _ = load_checkpoint(ckpt_path, device=self.device, prefer_ema=True)
+            else:
+                net = IntransitiveNet().to(self.device)
+                net.eval()
             self._loaded_nets[key] = net
 
         return AlphaZeroPlayer(
-            network=self._loaded_nets[key],
+            network=self._loaded_nets[key],  # type: ignore[arg-type]
             num_simulations=sims,
             temperature=0.0,
             device=self.device,
+            tablebase=self.tablebase,
+            min_pv_depth=6,
             name=f"AlphaZero ({ckpt_path.stem})",
         )
 
@@ -206,9 +216,15 @@ class IntransitiveGUI:
             return None
         sims = int(self.sims_var.get())
         if choice == "AlphaZero (Best)":
-            return self._load_alphazero("checkpoints/alphazero_best.pt", sims)
+            return self._load_alphazero(
+                ["checkpoints/alphazero_v2_best.pt", "checkpoints/alphazero_best.pt", "checkpoints/alphazero_latest.pt"],
+                sims,
+            )
         if choice == "AlphaZero (Latest)":
-            return self._load_alphazero("checkpoints/alphazero_latest.pt", sims)
+            return self._load_alphazero(
+                ["checkpoints/alphazero_v2_latest.pt", "checkpoints/alphazero_latest.pt"],
+                sims,
+            )
         if choice == "Minimax (d=2)":
             return MinimaxPlayer(depth=2)
         if choice == "GreedyBot":
@@ -344,8 +360,8 @@ class IntransitiveGUI:
         sim_frame = tk.Frame(setup_frame, bg=th["surface"])
         sim_frame.pack(fill=tk.X, pady=(0, 10))
         tk.Label(sim_frame, text="MCTS Rollouts:", fg=th["ink_muted"], bg=th["surface"], font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self.sims_var = tk.IntVar(value=100)
-        sim_spin = tk.Spinbox(sim_frame, from_=10, to=600, increment=10, textvariable=self.sims_var, width=5)
+        self.sims_var = tk.IntVar(value=400)
+        sim_spin = tk.Spinbox(sim_frame, from_=10, to=2000, increment=20, textvariable=self.sims_var, width=5)
         sim_spin.pack(side=tk.RIGHT)
 
         # Action buttons
@@ -794,16 +810,25 @@ class IntransitiveGUI:
                 win_pct_for_active = (q + 1.0) * 50.0
                 blue_win_pct = win_pct_for_active if board_snapshot.side == BLUE else (100.0 - win_pct_for_active)
 
-                top_children = sorted(
-                    root_node.children.items(),
-                    key=lambda kv: kv[1].visit_count,
-                    reverse=True,
-                )[:3]
-                top_str = ", ".join(
-                    f"{action_to_uci(from_canonical_action(ca, board_snapshot.side))}({ch.visit_count})"
-                    for ca, ch in top_children
-                )
-                eval_str = f"Blue Win: {blue_win_pct:4.1f}% (Q={q:+.2f})\nTop: {top_str}"
+                pv_d = getattr(root_node, "pv_depth", 0)
+                tb_st = getattr(root_node, "tb_status", None)
+                children = getattr(root_node, "children", None) or {}
+                if children:
+                    top_children = sorted(
+                        children.items(),
+                        key=lambda kv: kv[1].visit_count,
+                        reverse=True,
+                    )[:3]
+                    top_str = ", ".join(
+                        f"{action_to_uci(from_canonical_action(ca, board_snapshot.side))}({ch.visit_count})"
+                        for ca, ch in top_children
+                    )
+                    detail_line = f"Top: {top_str}"
+                elif tb_st:
+                    detail_line = tb_st
+                else:
+                    detail_line = f"PV depth: {pv_d} | Visits: {root_node.visit_count}"
+                eval_str = f"Blue Win: {blue_win_pct:4.1f}% (Q={q:+.2f})\n{detail_line}"
 
             self.root.after(0, lambda: self._on_ai_finished(gen, chosen_uci, eval_str, blue_win_pct))
 

@@ -7,3 +7,17 @@ dist/
 build/
 .venv/
 venv/
+
+# Compiled C++17 native binaries (rebuilt per platform via scripts/build_cpp.py)
+bin/
+intransitive/native/*.dll
+intransitive/native/*.so
+intransitive/native/*.dylib
+
+# Generated 2-4 piece endgame tablebase binaries (~438 MB, generated via bin/tb_gen)
+data/tablebase/
+
+# Temporary atomic save artifacts & large replay buffer dumps
+checkpoints/*.tmp.pt
+*.tmp.npz
+replay_buffer.npz
